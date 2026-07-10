@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>柿の収穫判定</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; background-color: #f4f4f9; margin: 0; padding: 20px; }
+        .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        h1 { color: #ff6600; }
+        .upload-btn-wrapper { position: relative; overflow: hidden; display: inline-block; margin: 20px 0; }
+        .btn { border: 2px solid #ff6600; color: #ff6600; background-color: white; padding: 8px 20px; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; }
+        .btn:hover { background-color: #ff6600; color: white; }
+        /* input[type=file]をボタンの上に重ねて透明にする */
+        .upload-btn-wrapper input[type=file] { font-size: 100px; position: absolute; left: 0; top: 0; opacity: 0; cursor: pointer; }
+        .submit-btn { background-color: #ff6600; color: white; border: none; padding: 10px 30px; border-radius: 5px; font-size: 18px; cursor: pointer; margin-top: 10px; }
+        img { max-width: 100%; height: auto; margin-top: 20px; border-radius: 5px; border: 1px solid #ddd; }
+        .message { margin-top: 10px; font-weight: bold; color: #333; }
+        .loading { display: none; color: #666; margin-top: 10px; }
+    </style>
+    <script>
+        function showLoading() {
+            document.querySelector('.loading').style.display = 'block';
+        }
+    </script>
+</head>
+<body>
+
+<div class="container">
+    <h1>🍊 柿の収穫判定</h1>
+    <p>写真を撮るか、画像を選んでください</p>
+
+    <form method="POST" action="/upload" enctype="multipart/form-data" onsubmit="showLoading()">
+        
+        <div class="upload-btn-wrapper">
+            <button class="btn">📷 写真を選択 / 撮影</button>
+            <input type="file" name="file" accept="image/*" capture="environment" required>
+        </div>
+        <br>
+        <button type="submit" class="submit-btn">判定開始</button>
+    </form>
+
+    <div class="loading">解析中...お待ちください</div>
+
+    <div th:if="${message}" class="message">
+        <p th:text="${message}"></p>
+    </div>
+
+    <div th:if="${resultImage}">
+        <h3>判定結果:</h3>
+        <img th:src="${resultImage}" alt="判定結果画像">
+    </div>
+</div>
+
+</body>
+</html>
