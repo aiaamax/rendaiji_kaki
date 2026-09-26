@@ -18,7 +18,8 @@ import base64
 import numpy as np
 import cv2
 from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
 
 # =========================================================
@@ -40,6 +41,9 @@ model = YOLO(MODEL_PATH)
 print("モデルのロード完了。リクエスト受付を開始します。")
 
 app = FastAPI()
+
+# PWA用の静的ファイル(manifest.json, sw.js, アイコン)を配信
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 def get_harvest_label(mean_h):
@@ -118,6 +122,14 @@ def render_page(message: str = "", result_image_data_url: str = ""):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>柿の収穫判定</title>
+
+    <!-- PWA設定 -->
+    <link rel="manifest" href="/static/manifest.json">
+    <meta name="theme-color" content="#ff6600">
+    <link rel="apple-touch-icon" href="/static/icon-192.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
     <style>
         body {{ font-family: sans-serif; text-align: center; background-color: #f4f4f9; margin: 0; padding: 20px; }}
         .container {{ max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
@@ -134,6 +146,11 @@ def render_page(message: str = "", result_image_data_url: str = ""):
     <script>
         function showLoading() {{
             document.querySelector('.loading').style.display = 'block';
+        }}
+        if ('serviceWorker' in navigator) {{
+            window.addEventListener('load', () => {{
+                navigator.serviceWorker.register('/static/sw.js');
+            }});
         }}
     </script>
 </head>
@@ -196,3 +213,36 @@ async def upload(file: UploadFile = File(...)):
 @app.get("/health")
 async def health():
     return {"status": "ok", "model_loaded": model is not None}
+
+
+@app.post("/analyze")
+async def analyze_endpoint(file: UploadFile = File(...)):
+    """
+    Flutterアプリ(スマホアプリ)向けのエンドポイント。
+    HTMLは返さず、JSON形式で結果だけ返す。
+    """
+    contents = await file.read()
+
+    if not contents:
+        return JSONResponse({"message": "画像を選択してください"}, status_code=400)
+
+    np_arr = np.frombuffer(contents, np.uint8)
+    image_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+    if image_bgr is None:
+        return JSONResponse({"message": "画像を読み込めませんでした"}, status_code=400)
+
+    annotated, label = analyze(image_bgr)
+
+    if annotated is None:
+        return JSONResponse({"message": f"エラー: {label}"}, status_code=200)
+
+    ok, buf = cv2.imencode('.jpg', annotated)
+    b64_image = base64.b64encode(buf.tobytes()).decode('utf-8')
+    data_url = f"data:image/jpeg;base64,{b64_image}"
+
+    return JSONResponse({
+        "message": f"判定完了！ ({label})",
+        "label": label,
+        "resultImage": data_url
+    })
