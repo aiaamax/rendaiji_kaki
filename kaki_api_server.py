@@ -1,7 +1,7 @@
 """
 kaki_api_server.py
 -------------------
-Java不要、これ1本で完結するWebアプリ
+Java不要、これ1本で完結するWebアプリ。
 - モデルは起動時に1回だけロードして常駐させる
 - トップページ(アップロードフォーム)も、判定処理も、このファイルだけでやる
 
@@ -43,7 +43,10 @@ print("モデルのロード完了。リクエスト受付を開始します。"
 app = FastAPI()
 
 # PWA用の静的ファイル(manifest.json, sw.js, アイコン)を配信
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# staticフォルダがまだ無い場合はスキップ(サーバーがクラッシュしないように)
+import os
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 def get_harvest_label(mean_h):
