@@ -5,6 +5,10 @@ Java不要、これ1本で完結するWebアプリ。
 - モデルは起動時に1回だけロードして常駐させる
 - トップページ(アップロードフォーム)も、判定処理も、このファイルだけでやる
 
+判定のモード(mode):
+    center : 画面の中心に一番近い柿を1個だけ判定する(カメラ撮影・評価スクリプト用。今までと同じ)
+    all    : 写っている柿を全部判定する(「画像を選んで判定する」用。最大 MAX_KAKI 個)
+
 起動方法(ローカル確認用):
     pip install -r requirements.txt
     uvicorn kaki_api_server:app --host 0.0.0.0 --port 8000
@@ -15,9 +19,11 @@ Renderの設定:
 """
 
 import base64
+from collections import Counter
+
 import numpy as np
 import cv2
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
@@ -33,6 +39,10 @@ HARVEST_THRESHOLDS = {
     'OK_RATIO': 55.0,  # 下半分の55%以上がオレンジなら収穫OK
     'NG_RATIO': 20.0   # 下半分の20%以下ならNG(まだ青い)
 }
+
+# 「全部判定」モード用
+MAX_KAKI = 20          # 1枚の写真で判定する柿の最大数(多すぎるとサーバーのメモリが足りなくなる)
+MULTI_MIN_CONF = 0.25  # この確信度より低い検出は捨てる(誤検出を減らす。centerモードには効かない)
 
 # =========================================================
 # モデルは起動時に1回だけロードする(ここが最重要ポイント)
@@ -59,36 +69,13 @@ def get_harvest_label_by_ratio(orange_ratio):
         return "Check (Yellow)"
 
 
-def analyze(image_bgr):
-    """1枚の画像に対して推論を行い、画面中央に最も近い柿をHSV(下半分面積比率)で分析する"""
-
-    results = model(source=image_bgr, save=False, conf=0.1, iou=0.7,
-                     imgsz=INFER_IMG_SIZE, verbose=False)
-    result = results[0]
-
-    if result.masks is None or len(result.boxes) == 0:
-        return None, "柿が検出されませんでした"
-
-    # --- 画面中央に一番近い柿を1個だけ選別するロジック ---
+def judge_one(image_bgr, result, idx):
+    """idx番目の柿を1個だけ、HSV(下半分のオレンジ比率)で判定する。
+    成功したら (情報の辞書, None)、失敗したら (None, エラー文) を返す"""
     img_h, img_w = image_bgr.shape[:2]
-    center_x, center_y = img_w / 2, img_h / 2
 
-    best_idx = 0
-    min_distance = float('inf')
-
-    for idx, box in enumerate(result.boxes):
-        x1, y1, x2, y2 = box.xyxy.cpu().numpy()[0]
-        kaki_center_x = (x1 + x2) / 2
-        kaki_center_y = (y1 + y2) / 2
-        distance = (kaki_center_x - center_x) ** 2 + (kaki_center_y - center_y) ** 2
-        if distance < min_distance:
-            min_distance = distance
-            best_idx = idx
-
-    # 選ばれた柿のマスクデータを処理
-    mask = result.masks.data[best_idx].cpu().numpy()
-    mask_resized = cv2.resize(mask, (image_bgr.shape[1], image_bgr.shape[0]),
-                               interpolation=cv2.INTER_LINEAR)
+    mask = result.masks.data[idx].cpu().numpy()
+    mask_resized = cv2.resize(mask, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
     final_mask = (mask_resized > 0.5).astype('uint8') * 255
 
     contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -113,24 +100,99 @@ def analyze(image_bgr):
     orange_pixels = np.sum((h_values >= 0) & (h_values <= 30))
     orange_ratio = (orange_pixels / total_lower_pixels) * 100
 
-    harvest_label = get_harvest_label_by_ratio(orange_ratio)
-    text_color = (0, 255, 0) if "OK" in harvest_label else (
-        (0, 0, 255) if "NG" in harvest_label else (0, 255, 255))
-    text_to_draw = f"{harvest_label} (Orange={int(orange_ratio)}%)"
+    return {
+        "label": get_harvest_label_by_ratio(orange_ratio),
+        "orange_ratio": float(orange_ratio),
+        "box": (x, y, w, h),
+        "lower_mask": lower_mask,
+    }, None
 
-    # 描画処理(お尻部分を薄緑にハイライト)
-    annotated = image_bgr.copy()
+
+def draw_result(annotated, info, number=None):
+    """判定結果(お尻のハイライト・枠・ラベル)を画像に描き足して、その画像を返す"""
+    label = info["label"]
+    x, y, w, h = info["box"]
+    text_color = (0, 255, 0) if "OK" in label else (
+        (0, 0, 255) if "NG" in label else (0, 255, 255))
+    if number is None:   # 1個だけ判定するとき(今までと同じ表示)
+        text_to_draw = f"{label} (Orange={int(info['orange_ratio'])}%)"
+    else:                # 複数判定するときは、重ならないよう短くする(例: 「2: Check 37%」)
+        text_to_draw = f"{number}: {label.split(' ')[0]} {int(info['orange_ratio'])}%"
+
+    # お尻部分を薄緑にハイライト
     mask_color = np.zeros_like(annotated, dtype=np.uint8)
-    mask_color[lower_mask > 0] = (0, 255, 0)
+    mask_color[info["lower_mask"] > 0] = (0, 255, 0)
     annotated = cv2.addWeighted(annotated, 1, mask_color, 0.4, 0)
 
     cv2.rectangle(annotated, (x, y), (x + w, y + h), text_color, 4)
     (text_w, text_h), _ = cv2.getTextSize(text_to_draw, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-    cv2.rectangle(annotated, (x, y - text_h - 10), (x + text_w + 10, y), text_color, -1)
-    cv2.putText(annotated, text_to_draw, (x + 5, y - 5),
+    top = y - text_h - 10
+    if top < 0:  # 柿が画像の上端に近いときは、ラベルを枠の内側に描く(はみ出し防止)
+        top = y
+    left = max(0, min(x, annotated.shape[1] - text_w - 10))  # 右端からはみ出さない
+    cv2.rectangle(annotated, (left, top), (left + text_w + 10, top + text_h + 10), text_color, -1)
+    cv2.putText(annotated, text_to_draw, (left + 5, top + text_h + 5),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    return annotated
 
-    return annotated, harvest_label
+
+def analyze(image_bgr, multi=False):
+    """1枚の画像に対して推論を行い、HSV(下半分の面積比率)で収穫判定する。
+    multi=False : 画面中央に一番近い柿を1個だけ判定する
+    multi=True  : 写っている柿を全部判定する(最大 MAX_KAKI 個)
+
+    戻り値: (結果を描いた画像, 柿ごとの情報のリスト) 。リストの先頭が中心に一番近い柿。
+            失敗したら (None, エラー文)"""
+
+    results = model(source=image_bgr, save=False, conf=0.1, iou=0.7,
+                     imgsz=INFER_IMG_SIZE, verbose=False)
+    result = results[0]
+
+    if result.masks is None or len(result.boxes) == 0:
+        return None, "柿が検出されませんでした"
+
+    # --- 判定する柿を、画面中央に近い順に並べる ---
+    img_h, img_w = image_bgr.shape[:2]
+    center_x, center_y = img_w / 2, img_h / 2
+
+    candidates = []
+    for idx, box in enumerate(result.boxes):
+        if multi and float(box.conf[0]) < MULTI_MIN_CONF:
+            continue
+        x1, y1, x2, y2 = box.xyxy.cpu().numpy()[0]
+        kaki_center_x = (x1 + x2) / 2
+        kaki_center_y = (y1 + y2) / 2
+        distance = (kaki_center_x - center_x) ** 2 + (kaki_center_y - center_y) ** 2
+        candidates.append((distance, idx))
+
+    if not candidates:
+        return None, "柿が検出されませんでした"
+
+    candidates.sort()
+    candidates = candidates[:MAX_KAKI] if multi else candidates[:1]
+
+    annotated = image_bgr.copy()
+    infos, last_error = [], ""
+    for distance, idx in candidates:
+        info, err = judge_one(image_bgr, result, idx)
+        if info is None:
+            last_error = err
+            continue
+        infos.append(info)
+        annotated = draw_result(annotated, info, number=len(infos) if multi else None)
+
+    if not infos:
+        return None, last_error
+    return annotated, infos
+
+
+def summarize_labels(infos):
+    """画面に出す一言。1個ならそのラベル、複数なら「4個検出: OK 2 / NG 2」の形"""
+    if len(infos) == 1:
+        return infos[0]["label"]
+    counts = Counter(i["label"].split(" ")[0] for i in infos)  # OK / Check / NG
+    parts = [f"{k} {counts[k]}" for k in ("OK", "Check", "NG") if counts.get(k)]
+    return f"{len(infos)}個検出: " + " / ".join(parts)
 
 
 # =========================================================
@@ -242,6 +304,8 @@ def render_page(message: str = "", result_image_data_url: str = ""):
 
     <form id="uploadForm" method="POST" action="/upload" enctype="multipart/form-data">
         <input type="file" id="fileInput" name="file" style="display:none;">
+        <!-- center: 中心の柿を1個だけ判定 / all: 写っている柿を全部判定 -->
+        <input type="hidden" id="modeInput" name="mode" value="center">
         <!-- 撮影前: シャッターボタン -->
         <button type="button" class="submit-btn" id="shootBtn" onclick="captureFrame()">パシャリ！撮影する</button>
         <!-- 撮影後(画面が止まった状態): 判定 or 撮り直し -->
@@ -253,7 +317,7 @@ def render_page(message: str = "", result_image_data_url: str = ""):
     <div id="pickArea">
         <input type="file" id="pickInput" accept="image/*" style="display:none;" onchange="pickAndSubmit(event)">
         <button type="button" class="sub-btn" onclick="document.getElementById('pickInput').click()">画像を選んで判定する</button>
-        <p class="hint">選ぶ画像は、判定したい柿が真ん中に写っているものがおすすめです</p>
+        <p class="hint">写っている柿を全部判定します(最大{MAX_KAKI}個)</p>
     </div>
 
     <canvas id="canvas"></canvas>
@@ -267,6 +331,7 @@ def render_page(message: str = "", result_image_data_url: str = ""):
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');
     const fileInput = document.getElementById('fileInput');
+    const modeInput = document.getElementById('modeInput');
     const uploadForm = document.getElementById('uploadForm');
     const loadingText = document.getElementById('loadingText');
 
@@ -335,9 +400,10 @@ def render_page(message: str = "", result_image_data_url: str = ""):
         }}, 'image/jpeg', 0.85);
     }}
 
-    // 止めた画像を確認したあと、判定に送る
+    // 止めた画像を確認したあと、判定に送る(カメラ撮影は、中心の柿を1個だけ判定)
     function sendCaptured() {{
         if (!capturedBlob) return;
+        modeInput.value = 'center';
         loadingText.style.display = 'block';
         sendBtn.disabled = true;
         retakeBtn.disabled = true;
@@ -357,10 +423,11 @@ def render_page(message: str = "", result_image_data_url: str = ""):
         setMode('live');
     }}
 
-    // 選んだ画像を(大きすぎる場合は縮小して)送信する
+    // 選んだ画像を(大きすぎる場合は縮小して)送信する。選んだ画像は、写っている柿を全部判定
     async function pickAndSubmit(event) {{
         const picked = event.target.files[0];
         if (!picked) return;
+        modeInput.value = 'all';
         loadingText.style.display = 'block';
 
         let fileToSend = picked;
@@ -407,7 +474,7 @@ async def index():
 
 
 @app.post("/upload", response_class=HTMLResponse)
-async def upload(file: UploadFile = File(...)):
+async def upload(file: UploadFile = File(...), mode: str = Form("center")):
     contents = await file.read()
 
     if not contents:
@@ -419,16 +486,17 @@ async def upload(file: UploadFile = File(...)):
     if image_bgr is None:
         return render_page(message="画像を読み込めませんでした")
 
-    annotated, label = analyze(image_bgr)
+    annotated, infos = analyze(image_bgr, multi=(mode == "all"))
 
     if annotated is None:
-        return render_page(message=f"エラー: {label}")
+        return render_page(message=f"エラー: {infos}")
 
     ok, buf = cv2.imencode('.jpg', annotated)
     b64_image = base64.b64encode(buf.tobytes()).decode('utf-8')
     data_url = f"data:image/jpeg;base64,{b64_image}"
 
-    return render_page(message=f"判定完了！ ({label})", result_image_data_url=data_url)
+    return render_page(message=f"判定完了！ ({summarize_labels(infos)})",
+                       result_image_data_url=data_url)
 
 
 @app.get("/health")
@@ -437,10 +505,13 @@ async def health():
 
 
 @app.post("/analyze")
-async def analyze_endpoint(file: UploadFile = File(...)):
+async def analyze_endpoint(file: UploadFile = File(...), mode: str = Form("center")):
     """
-    Flutterアプリ(スマホアプリ)向けのエンドポイント。
+    Flutterアプリ(スマホアプリ)・評価スクリプト向けのエンドポイント。
     HTMLは返さず、JSON形式で結果だけ返す。
+    mode を送らなければ、今までどおり「中心の柿を1個だけ」判定する(label もそのまま)。
+    mode=all を送ると、写っている柿を全部判定する。label は中心に一番近い柿のもので、
+    全部の結果は results に入る。
     """
     contents = await file.read()
 
@@ -453,17 +524,23 @@ async def analyze_endpoint(file: UploadFile = File(...)):
     if image_bgr is None:
         return JSONResponse({"message": "画像を読み込めませんでした"}, status_code=400)
 
-    annotated, label = analyze(image_bgr)
+    annotated, infos = analyze(image_bgr, multi=(mode == "all"))
 
     if annotated is None:
-        return JSONResponse({"message": f"エラー: {label}"}, status_code=200)
+        return JSONResponse({"message": f"エラー: {infos}"}, status_code=200)
 
     ok, buf = cv2.imencode('.jpg', annotated)
     b64_image = base64.b64encode(buf.tobytes()).decode('utf-8')
     data_url = f"data:image/jpeg;base64,{b64_image}"
 
     return JSONResponse({
-        "message": f"判定完了！ ({label})",
-        "label": label,
-        "resultImage": data_url
+        "message": f"判定完了！ ({summarize_labels(infos)})",
+        "label": infos[0]["label"],
+        "resultImage": data_url,
+        "results": [
+            {"label": i["label"],
+             "orangeRatio": round(i["orange_ratio"], 1),
+             "box": list(i["box"])}
+            for i in infos
+        ],
     })
